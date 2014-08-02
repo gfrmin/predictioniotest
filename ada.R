@@ -76,3 +76,6 @@ varImpPlot(usersrfcancel) # interestingly month of signup is most important in p
 usersplus[,canceldays := difftime(cancel_date, signup_date, units = "days")]
 usersrfcanceltime <- randomForest(canceldays ~ gender+age+paymentplan+profile_picture+goal+diet+timezoneoffset+app_open+logged_meal+logged_weight+meal_approved+received_comment+year+month+wday+mday+hour+minute+second, data = usersplus, importance = TRUE, ntree = 1000, subset = !is.na(canceldays)) # around 48% of variance explained
 varImpPlot(usersrfcanceltime) # number of received_comments most predictive, followed by number of logged_meal
+
+userspluscanceltimepreds <- usersplus[is.na(canceldays)]
+userspluscanceltimepreds[, preds := predict(usersrfcanceltime, usersplus[is.na(canceldays)])] # make predictions for those who haven't cancelled yet
