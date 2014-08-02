@@ -3,6 +3,8 @@ library(lubridate)
 options(lubridate.fasttime = TRUE)
 library(plyr)
 library(randomForest)
+library(randomForestSRC)
+library(pec)
 library(reshape2)
 
 users <- fread("ada/Ada_users.csv")
@@ -52,7 +54,7 @@ setkey(usersextra, user_id, timestamp)
 usersextra <- data.table(ddply(usersextra, "user_id", function(x) {x[x$timestamp <= x[x$event_type == "cancel",]$timestamp,]}))
 setkey(usersextra, user_id)
 usersextra <- usersextra[event_type != "cancel"]
-write.csv(usersextra, file = "usersextra.csv", row.names = FALSE)
+# write.csv(usersextra, file = "usersextra.csv", row.names = FALSE)
 
 ## simplest model: count number of incidents to predict cancellation
 
@@ -63,19 +65,43 @@ usersextran <- usersextran[,lapply(.SD, function(x) {ifelse(is.na(x), 0, x)})]
 usersplus <- merge(users, usersextran)
 usersplus[,`:=`(year = year(signup_date), month = month(signup_date), wday = wday(signup_date), mday = mday(signup_date), hour = hour(signup_date), minute = minute(signup_date), second = second(signup_date))]
 
-usersplus[,cancelled := factor(as.numeric(!is.na(cancel_date)))]
-# write.csv(usersplus, "usersplus.csv")
+usersplus[,cancelled := as.numeric(!is.na(cancel_date))]
+usersplus[,canceldays := difftime(cancel_date, signup_date, units = "days")]
+usersplus[,canceldaysnumber := as.numeric(canceldays)]
+lastcanceldate <- max(usersplus$cancel_date, na.rm = TRUE) + days(1)
+epochtodate <- function(epochseconds) {as.POSIXct(epochseconds, origin = "1970-01-01", tz = "GMT")}
+usersplus[,canceldatecensored := epochtodate(ifelse(is.na(cancel_date), lastcanceldate, cancel_date))]
+usersplus[,canceldayscensored := difftime(canceldatecensored, signup_date, units = "days")]
+usersplus[,canceldayscensorednumber := as.numeric(canceldayscensored)]
+write.csv(usersplus, "usersplus.csv")
 
 
-usersrfcancel <- randomForest(cancelled ~ gender+age+paymentplan+profile_picture+goal+diet+timezoneoffset+app_open+logged_meal+logged_weight+meal_approved+received_comment+year+month+wday+mday+hour+minute+second, data = usersplus, importance = TRUE, ntree = 1000) # around 19% error rate
+usersrfcancel <- randomForest(factor(cancelled) ~ gender+age+paymentplan+profile_picture+goal+diet+timezoneoffset+app_open+logged_meal+logged_weight+meal_approved+received_comment+year+month+wday+mday+hour+minute+second, data = usersplus, importance = TRUE, ntree = 1000) # around 19% error rate
 varImpPlot(usersrfcancel) # interestingly month of signup is most important in predicting whether customer will cancel by now
 
 
 ## now predict WHEN customer will cancel by converting cancellation date into number of seconds since January 1st 2014
 
-usersplus[,canceldays := difftime(cancel_date, signup_date, units = "days")]
 usersrfcanceltime <- randomForest(canceldays ~ gender+age+paymentplan+profile_picture+goal+diet+timezoneoffset+app_open+logged_meal+logged_weight+meal_approved+received_comment+year+month+wday+mday+hour+minute+second, data = usersplus, importance = TRUE, ntree = 1000, subset = !is.na(canceldays)) # around 48% of variance explained
 varImpPlot(usersrfcanceltime) # number of received_comments most predictive, followed by number of logged_meal
 
 userspluscanceltimepreds <- usersplus[is.na(canceldays)]
 userspluscanceltimepreds[, preds := predict(usersrfcanceltime, usersplus[is.na(canceldays)])] # make predictions for those who haven't cancelled yet
+
+# random survival forest
+
+usersrsf <- rfsrc(Surv(canceldayscensorednumber, cancelled) ~ gender+age+paymentplan+profile_picture+goal+diet+timezoneoffset+app_open+logged_meal+logged_weight+meal_approved+received_comment+year+month+wday+mday+hour+minute+second, data = usersplus, importance = "none", ntree = 500, splitrule = "logrankscore")
+cat("error rate:" , usersrsf$err.rate[usersrsf$ntree], "\n")
+
+predictSurvProb.rfsrc <- function(object, newdata, times, ...){
+    ptemp <- predict(object,newdata=newdata,...)$survival
+    pos <- sindex(jump.times = object$time.interest, eval.times = times)
+    p <- cbind(1,ptemp)[, pos + 1]
+    if (NROW(p) != NROW(newdata) || NCOL(p) != length(times))
+        stop("Prediction failed")
+    p
+}
+
+pec.f <- as.formula(Hist(canceldayscensorednumber, cancelled) ~ 1)
+usersrsfprederror <- pec(list(usersrsf), data = usersplus, formula = pec.f,
+                        splitMethod = "bootcv", B = 50)
