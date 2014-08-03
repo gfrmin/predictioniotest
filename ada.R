@@ -6,21 +6,23 @@ library(randomForest)
 library(randomForestSRC)
 library(pec)
 library(reshape2)
+library(survival)
+library(peperr)
 
 users <- fread("ada/Ada_users.csv")
 users[,`:=`(gender = factor(gender), paymentplan = factor(paymentplan), goal = factor(goal), diet = factor(diet))]
-users$signup_date <- ymd_hms(users$signup_date)
-users$cancel_date <- ymd_hms(users$cancel_date)
+users$signup_date <- ymd_hms(users$signup_date, tz = "UTC")
+users$cancel_date <- ymd_hms(users$cancel_date, tz = "UTC")
 appopen <- fread("ada/Ada_events_app_open.csv")
-appopen$timestamp <- ymd_hms(appopen$timestamp)
+appopen$timestamp <- ymd_hms(appopen$timestamp, tz = "UTC")
 loggedmeal <- fread("ada/Ada_events_logged_meal.csv")
-loggedmeal$timestamp <- ymd_hms(loggedmeal$timestamp)
+loggedmeal$timestamp <- ymd_hms(loggedmeal$timestamp, tz = "UTC")
 loggedweight <- fread("ada/Ada_events_logged_weight.csv")
-loggedweight$timestamp <- ymd_hms(loggedweight$timestamp)
+loggedweight$timestamp <- ymd_hms(loggedweight$timestamp, tz = "UTC")
 mealapproved <- fread("ada/Ada_events_meal_approved.csv"); mealapproved[,`:=`(V4 = NULL, V5 = NULL, V6 = NULL)]
-mealapproved$timestamp <- ymd_hms(mealapproved$timestamp)
+mealapproved$timestamp <- ymd_hms(mealapproved$timestamp, tz = "UTC")
 receivedcomment <- fread("ada/Ada_events_received_comment.csv")
-receivedcomment$timestamp <- ymd_hms(receivedcomment$timestamp)
+receivedcomment$timestamp <- ymd_hms(receivedcomment$timestamp, tz = "UTC")
 
 
 length(appopen$user_id)
@@ -50,7 +52,6 @@ canceldate[is.na(cancel_date), cancel_date := ymd("2222-12-12")] # cancel date f
 setnames(canceldate, "cancel_date", "timestamp")
 usersextra <- data.table(rbind.fill(appopen, loggedmeal, loggedweight, mealapproved, receivedcomment, canceldate))
 setkey(usersextra, user_id, timestamp)
-
 usersextra <- data.table(ddply(usersextra, "user_id", function(x) {x[x$timestamp <= x[x$event_type == "cancel",]$timestamp,]}))
 setkey(usersextra, user_id)
 usersextra <- usersextra[event_type != "cancel"]
@@ -92,8 +93,9 @@ userspluscanceltimepreds[, preds := predict(usersrfcanceltime, usersplus[is.na(c
 
 usersrsf <- rfsrc(Surv(canceldayscensorednumber, cancelled) ~ gender+age+paymentplan+profile_picture+goal+diet+timezoneoffset+app_open+logged_meal+logged_weight+meal_approved+received_comment+year+month+wday+mday+hour+minute+second, data = usersplus, importance = "none", ntree = 500, splitrule = "logrankscore")
 cat("error rate:" , usersrsf$err.rate[usersrsf$ntree], "\n")
+plot.survival(usersrsf) # estimate of survival function
 
-predictSurvProb.rfsrc <- function(object, newdata, times, ...){
+predictSurvProb.rfsrc <- function(object, newdata, times, ...){ # predict probability of cancelling by a particular time (or times) given certain covariates; needed for next couple of lines
     ptemp <- predict(object,newdata=newdata,...)$survival
     pos <- sindex(jump.times = object$time.interest, eval.times = times)
     p <- cbind(1,ptemp)[, pos + 1]
@@ -101,7 +103,43 @@ predictSurvProb.rfsrc <- function(object, newdata, times, ...){
         stop("Prediction failed")
     p
 }
-
 pec.f <- as.formula(Hist(canceldayscensorednumber, cancelled) ~ 1)
 usersrsfprederror <- pec(list(usersrsf), data = usersplus, formula = pec.f,
                         splitMethod = "bootcv", B = 50)
+
+
+## user time series
+
+signupdate <- users[,list(user_id, signup_date)]; signupdate[, event_type := "signup"]
+setnames(signupdate, "signup_date", "timestamp")
+canceldate <- users[!is.na(cancel_date),list(user_id, cancel_date)]; canceldate[, event_type := "cancel"]
+setnames(canceldate, "cancel_date", "timestamp")
+userstimeseries <- data.table(rbind.fill(signupdate, canceldate, usersextra))
+setkey(userstimeseries, user_id, timestamp)
+userstimeseries <- data.table(ddply(userstimeseries, "user_id", function(x) {x[x$timestamp >= x[x$event_type == "signup",]$timestamp,]}))
+setkey(userstimeseries, user_id, timestamp)
+userstimeseries[,timeend := c(ymd_hms(timestamp[2:.N], tz = "UTC"), NA), by = user_id]
+userstimeseries[,event_type := event_type[2:.N], by = user_id]
+userstimeseries[,`:=`(appopensum = cumsum(event_type == "app_open"), loggedmealsum = cumsum(event_type == "logged_meal"), loggedweightsum = cumsum(event_type == "logged_weight"), mealapprovedsum = cumsum(event_type == "meal_approved"), receivedcommentsum = cumsum(event_type == "received_comment"), cancelled = cumsum(event_type == "cancel")), by = user_id]
+userstimeseries <- userstimeseries[,list(user_id, timestamp, timeend, appopensum, loggedmealsum, loggedweightsum, mealapprovedsum, receivedcommentsum, cancelled)]
+userstimeseries <- userstimeseries[!(cancelled == 1 & is.na(timeend))]
+userstimeseries[is.na(timeend), timeend := ymd_hms("2014-06-01 00:00:00", tz="UTC")]
+userstimeseries[,timeend := as.numeric(difftime(timeend, timestamp[1], units="hours")), by = user_id]
+userstimeseries[,timestamp := as.numeric(difftime(timestamp, timestamp[1], units="hours")), by = user_id]
+userstimeseries[timeend <= timestamp, timeend := timestamp + 1/3600] # when events happen at the same time
+setnames(userstimeseries, "timestamp", "timestart")
+setkey(userstimeseries, user_id, timestart)
+
+usersconstants <- users[,list(user_id, gender, age, paymentplan, profile_picture, goal, diet)]
+setkey(usersconstants, user_id)
+userstimeseriesplus <- usersconstants[userstimeseries]
+
+
+# models on time series
+
+userstimeseriespluscox <- coxph(Surv(timestart, timeend, cancelled) ~ appopensum+loggedmealsum+loggedweightsum+mealapprovedsum+receivedcommentsum+gender+age+paymentplan+profile_picture+goal+diet, data = userstimeseriesplus) # concordance is 68%
+
+
+
+#usersresults <- userstimeseriesplus[,tail(.SD,1),by=user_id]
+#userstimeseriesprederror <- pec(object = list(userstimeseriespluscox), data = usersresults[1:5], formula = as.formula(Hist(timeend, cancelled) ~ 1), splitMethod = "none")
