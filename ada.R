@@ -8,6 +8,7 @@ library(pec)
 library(reshape2)
 library(survival)
 library(peperr)
+library(ROCR)
 
 users <- fread("ada/Ada_users.csv")
 users[,`:=`(gender = factor(gender), paymentplan = factor(paymentplan), goal = factor(goal), diet = factor(diet))]
@@ -137,9 +138,16 @@ userstimeseriesplus <- usersconstants[userstimeseries]
 
 # models on time series
 
-userstimeseriespluscox <- coxph(Surv(timestart, timeend, cancelled) ~ appopensum+loggedmealsum+loggedweightsum+mealapprovedsum+receivedcommentsum+gender+age+paymentplan+profile_picture+goal+diet, data = userstimeseriesplus) # concordance is 68%
+userstimeseriespluscox <- coxph(Surv(timestart, timeend, cancelled) ~ appopensum+loggedmealsum+loggedweightsum+mealapprovedsum+receivedcommentsum+gender+age+paymentplan+profile_picture+goal+diet, data = userstimeseriesplus[unique(user_id)[1:630]]) # concordance is 68%
+userstimeseriespluscoxpreds <- predict(userstimeseriespluscox, newdata = userstimeseriesplus[unique(user_id)[631:902]], type='expected')
+# mresid <- (userstimeseriesplus[unique(user_id)[631:902]]$cancelled) - predict(userstimeseriespluscox, newdata = userstimeseriesplus[unique(user_id)[631:902]], type='expected')
 
+rocpred <- prediction(userstimeseriespluscoxpreds, userstimeseriesplus[unique(user_id)[631:902]]$cancelled)
+rocperf <- performance(pred, measure = "tpr", x.measure = "fpr") 
+rocauc <- performance(pred, measure = "auc") # AUC of 0.85 on validation dataset!
+png("roccurve.png")
+plot(rocperf, col=rainbow(10))
+dev.off()
 
-
-#usersresults <- userstimeseriesplus[,tail(.SD,1),by=user_id]
-#userstimeseriesprederror <- pec(object = list(userstimeseriespluscox), data = usersresults[1:5], formula = as.formula(Hist(timeend, cancelled) ~ 1), splitMethod = "none")
+userstimeseriespluscoxsurvfit <- survfit(userstimeseriespluscox)
+plot(userstimeseriespluscoxsurvfit) # "mean" survival curve
